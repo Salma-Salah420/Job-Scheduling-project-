@@ -1,0 +1,329 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+
+class Job:
+    def __init__(self, job_id, duration, allowed_resources=None, dependencies=None):
+        self.job_id = job_id
+        self.duration = duration
+        self.allowed_resources = allowed_resources if allowed_resources is not None else []
+        self.dependencies = dependencies if dependencies is not None else []
+
+
+class JobSchedulerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Job Scheduler")
+        self.root.configure(bg="#f0f4f8")
+        self.jobs = []
+        self.max_jobs = None
+        self.num_machines = None
+        self.resource_caps = None
+        self.quantum = None
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TLabel", background="#f0f4f8", font=("Segoe UI", 10))
+        style.configure("TButton", background="#007acc", foreground="white", font=("Segoe UI", 10), padding=6)
+        style.map("TButton", background=[("active", "#005f99")])
+
+        self.resource_frame = ttk.LabelFrame(root, text="Resource Settings", padding=(10, 5))
+        self.resource_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(self.resource_frame, text="Number of Machines:").grid(row=0, column=0)
+        self.num_machines_entry = ttk.Entry(self.resource_frame, width=5)
+        self.num_machines_entry.grid(row=0, column=1, padx=5)
+
+        ttk.Label(self.resource_frame, text="Capacities (comma-separated):").grid(row=0, column=2)
+        self.resource_caps_entry = ttk.Entry(self.resource_frame, width=30)
+        self.resource_caps_entry.grid(row=0, column=3, padx=5)
+
+        ttk.Label(self.resource_frame, text="Quantum:").grid(row=1, column=0)
+        self.quantum_entry = ttk.Entry(self.resource_frame, width=5)
+        self.quantum_entry.grid(row=1, column=1, padx=5)
+
+        self.job_count_frame = ttk.LabelFrame(root, text="Job Configuration", padding=(10, 5))
+        self.job_count_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(self.job_count_frame, text="Number of Jobs:").grid(row=0, column=0)
+        self.num_jobs_entry = ttk.Entry(self.job_count_frame, width=5)
+        self.num_jobs_entry.grid(row=0, column=1, padx=5)
+
+        self.set_jobs_btn = ttk.Button(self.job_count_frame, text="Set", command=self.set_job_count)
+        self.set_jobs_btn.grid(row=0, column=2, padx=10, pady=5)
+
+        self.job_frame = ttk.LabelFrame(root, text="Add Job", padding=(10, 5))
+        self.job_frame.pack(fill="x", padx=10, pady=5)
+
+        self.entries = {}
+        fields = ["Duration", "Allowed Resources (comma)", "Dependencies (comma)"]
+        for i, field in enumerate(fields):
+            ttk.Label(self.job_frame, text=field + ":").grid(row=0, column=2 * i, padx=5)
+            e = ttk.Entry(self.job_frame, width=25)
+            e.grid(row=0, column=2 * i + 1, padx=5)
+            self.entries[field] = e
+
+        self.add_btn = ttk.Button(self.job_frame, text="Add", command=self.add_job)
+        self.add_btn.grid(row=1, column=0, pady=10)
+
+        self.job_listbox = tk.Listbox(self.job_frame, height=5, width=90)
+        self.job_listbox.grid(row=2, column=0, columnspan=6, pady=5)
+
+        self.run_btn = ttk.Button(root, text="Run Scheduler", command=self.run_scheduler)
+        self.run_btn.pack(pady=15)
+
+        self.gantt_btn = ttk.Button(root, text="Show Gantt Chart", command=self.show_gantt_chart)
+        self.gantt_btn.pack(pady=5)
+
+        self.result_frame = ttk.LabelFrame(root, text="Schedule Result", padding=(10, 5))
+        self.result_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.result_text = tk.Text(self.result_frame, height=10, bg="#ffffff", fg="#333333", font=("Consolas", 10))
+        self.result_text.pack(fill="both", expand=True)
+
+    def set_job_count(self):
+        try:
+            self.max_jobs = int(self.num_jobs_entry.get())
+            if self.max_jobs < 0:
+                raise ValueError("Number of jobs must be non-negative.")
+            self.jobs = []
+            self.job_listbox.delete(0, tk.END)
+            messagebox.showinfo("Success", f"Number of jobs set to {self.max_jobs}.")
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid number for jobs.")
+
+    def run_scheduler(self):
+        self.result_text.delete(1.0, tk.END)
+
+        try:
+            self.num_machines = int(self.num_machines_entry.get())
+            self.resource_caps = list(map(int, self.resource_caps_entry.get().split(',')))
+            quantum_str = self.quantum_entry.get().strip()
+            self.quantum = int(quantum_str) if quantum_str else 0
+
+            if self.num_machines <= 0 or self.quantum <= 0 or any(r < 0 for r in self.resource_caps):
+                messagebox.showerror("Error", "num_machines must be positive and quantum must be greater than 0.")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid numbers for machines, resources, and quantum.")
+            return
+
+        if len(self.resource_caps) != self.num_machines:
+            messagebox.showerror("Error", "Number of resources does not match the number of machines.")
+            return
+
+        if len(self.jobs) == 0:
+            messagebox.showerror("Error", "No jobs have been added. Please add jobs before scheduling.")
+            return
+
+        for job1 in self.jobs:
+            for job2 in self.jobs:
+                if job1.job_id != job2.job_id:
+                    if (job2.job_id in job1.dependencies) and (job1.job_id in job2.dependencies):
+                        messagebox.showerror("Error",
+                                             f"Cyclic dependency detected between Job {job1.job_id} and Job {job2.job_id}")
+                        return
+
+        total_capacity = sum(self.resource_caps)
+        for job in self.jobs:
+            if job.duration > total_capacity:
+                messagebox.showerror("Error",
+                                     f"Job {job.job_id} cannot be scheduled. Duration exceeds total machine capacity.")
+                return
+
+        if self.quantum > 0:
+            self.round_robin_scheduler()
+        else:
+            self.backtracking_scheduler()
+
+    def round_robin_scheduler(self):
+        self.result_text.insert(tk.END, "Running Round Robin Scheduler with Quantum...\n")
+
+        remaining_time = [job.duration for job in self.jobs]
+        schedule = {i: [] for i in range(self.num_machines)}
+        current_time = [0] * self.num_machines
+
+        while any(remaining_time):
+            for i in range(len(self.jobs)):
+                if remaining_time[i] <= 0:
+                    continue
+
+                job = self.jobs[i]
+                time_to_execute = min(remaining_time[i], self.quantum)
+
+                scheduled = False
+                for machine in range(self.num_machines):
+                    if (not job.allowed_resources or machine in job.allowed_resources) and \
+                            sum(task[2] - task[1] for task in schedule[machine]) + time_to_execute <= \
+                            self.resource_caps[machine]:
+                        start_time = current_time[machine]
+                        end_time = start_time + time_to_execute
+
+                        schedule[machine].append((job.job_id, start_time, end_time))
+                        current_time[machine] = end_time
+                        remaining_time[i] -= time_to_execute
+
+                        scheduled = True
+                        break
+
+                if not scheduled:
+                    self.result_text.insert(tk.END,
+                                            f"Job {job.job_id} cannot be scheduled due to resource constraints.\n")
+                    return
+
+        self.result_text.insert(tk.END, "\nRound Robin Scheduling Results:\n")
+        for machine, tasks in schedule.items():
+            self.result_text.insert(tk.END, f"Machine {machine}:\n")
+            for task in tasks:
+                job_id, start_time, end_time = task
+                duration = end_time - start_time
+                self.result_text.insert(tk.END,
+                                        f"  Job {job_id} | Start: {start_time} | End: {end_time} | Duration: {duration}\n")
+
+        self.schedule = schedule
+
+        machine_finish_times = []
+        for tasks in schedule.values():
+            if tasks:
+                last_task = tasks[-1]
+                _, start_time, end_time = last_task
+                machine_finish_times.append(end_time)
+
+        if machine_finish_times:
+            Min_Makspan = max(machine_finish_times)
+            self.result_text.insert(tk.END, f"\nMin_Makspan: {Min_Makspan}\n")
+
+        self.show_gantt_chart()
+
+    def backtracking_scheduler(self):
+        self.result_text.insert(tk.END, "Running Backtracking Scheduler...\n")
+
+        schedule = {i: [] for i in range(self.num_machines)}
+        machine_loads = [0] * self.num_machines
+
+        def backtrack(job_index):
+            if job_index == len(self.jobs):
+                return True
+
+            job = self.jobs[job_index]
+            for machine in range(self.num_machines):
+                if job.allowed_resources and machine not in job.allowed_resources:
+                    continue
+
+                if machine_loads[machine] + job.duration <= self.resource_caps[machine]:
+                    start_time = machine_loads[machine]
+                    end_time = start_time + job.duration
+                    schedule[machine].append((job.job_id, start_time, end_time))
+                    machine_loads[machine] += job.duration
+
+                    if backtrack(job_index + 1):
+                        return True
+
+                    schedule[machine].pop()
+                    machine_loads[machine] -= job.duration
+
+            return False
+
+        if backtrack(0):
+            self.result_text.insert(tk.END, "\nBacktracking Scheduling Results:\n")
+            for machine, tasks in schedule.items():
+                self.result_text.insert(tk.END, f"Machine {machine}:\n")
+                for task in tasks:
+                    job_id, start_time, end_time = task
+                    duration = end_time - start_time
+                    self.result_text.insert(tk.END,
+                                            f"  Job {job_id} | Start: {start_time} | End: {end_time} | Duration: {duration}\n")
+            self.schedule = schedule
+
+            machine_finish_times = []
+            for tasks in schedule.values():
+                if tasks:
+                    last_task = tasks[-1]
+                    _, start_time, end_time = last_task
+                    machine_finish_times.append(end_time)
+
+            if machine_finish_times:
+                Min_Makspan = max(machine_finish_times)
+                self.result_text.insert(tk.END, f"\nMin_Makspan: {Min_Makspan}\n")
+
+            self.show_gantt_chart()
+        else:
+            self.result_text.insert(tk.END, "No valid schedule found with backtracking.\n")
+
+    def add_job(self):
+        duration = self.entries["Duration"].get()
+        allowed_resources = self.entries["Allowed Resources (comma)"].get()
+        dependencies = self.entries["Dependencies (comma)"].get()
+
+        try:
+            duration = int(duration)
+            allowed_resources = [int(x) for x in allowed_resources.split(",")] if allowed_resources else []
+            dependencies = [int(x) for x in dependencies.split(",")] if dependencies else []
+            if duration <= 0:
+                messagebox.showerror("Error", "Duration must be a positive number.")
+                return
+            if any(r < 0 for r in allowed_resources) or any(d < 0 for d in dependencies):
+                messagebox.showerror("Error", "Negative values are not allowed in resources or dependencies.")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid values for duration, resources, and dependencies.")
+            return
+
+        job_id = len(self.jobs) + 1
+        new_job = Job(job_id, duration, allowed_resources, dependencies)
+        self.jobs.append(new_job)
+
+        self.job_listbox.insert(tk.END,
+                                f"Job {job_id}: Duration = {duration}, Resources = {allowed_resources}, Dependencies = {dependencies}")
+
+        self.entries["Duration"].delete(0, tk.END)
+        self.entries["Allowed Resources (comma)"].delete(0, tk.END)
+        self.entries["Dependencies (comma)"].delete(0, tk.END)
+
+        messagebox.showinfo("Success", f"Job {job_id} added successfully!")
+
+    def show_gantt_chart(self):
+        if not hasattr(self, 'schedule') or not self.schedule:
+            messagebox.showerror("Error", "No schedule found. Run scheduler first.")
+            return
+
+        try:
+            num_machines = int(self.num_machines_entry.get())
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid number of machines.")
+            return
+        fig, ax = plt.subplots()
+        colors = ['#ff6666', '#66b3ff', '#99ff99', '#ffcc99', '#c2c2f0', '#ffb3e6', '#ff6666',
+                  '#99b3b3', '#c2ffb3', '#ffb3b3', '#b3c2ff', '#b3e6ff', '#ffb3b3', '#ffcccc', '#e6b3ff']
+
+        for machine, tasks in self.schedule.items():
+            for task in tasks:
+                job_id, start, end = task
+                color = colors[job_id % len(colors)]
+
+                ax.add_patch(
+                    mpatches.Rectangle((start, machine), end - start, 0.8, facecolor=color,
+                                       edgecolor='black')
+                )
+                ax.text(start + (end - start) / 2, machine + 0.4, f"Job {job_id}", ha='center',
+                        va='center', fontsize=9)
+
+        ax.set_yticks([m + 0.4 for m in range(num_machines)])
+        ax.set_yticklabels([f"Machine {m}" for m in range(num_machines)])
+
+        max_time = max(end for tasks in self.schedule.values() for _, _, end in tasks)
+        ax.set_xlim(0, max_time + (self.quantum if self.quantum > 0 else 1))
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Machines")
+        ax.set_title("Gantt Chart for Job Schedule")
+        ax.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = JobSchedulerApp(root)
+    root.mainloop()
