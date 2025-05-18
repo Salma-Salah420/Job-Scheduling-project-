@@ -1,0 +1,793 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+from collections import defaultdict
+import random
+import math
+from copy import deepcopy
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+class Job:
+    def __init__(self, job_id, duration, dependencies=None):
+        self.job_id = job_id
+        self.duration = duration
+        self.dependencies = dependencies if dependencies else []
+
+
+class Resource:
+    def __init__(self, resource_id, capacity):
+        self.resource_id = resource_id
+        self.capacity = capacity
+        self.timeline = []
+
+
+class JobScheduler:
+    def __init__(self, jobs, resources, quantum=1, allow_chunking=False):
+        self.jobs = {job.job_id: job for job in jobs}
+        self.resources = {r.resource_id: r for r in resources}
+        self.quantum = quantum
+        self.allow_chunking = allow_chunking
+        self.best_schedule = None
+
+        self.min_makespan = float('inf')
+
+    def fitness(self, chromosome):
+        timelines = defaultdict(list)
+        completion_times = {}
+        resource_utilization = defaultdict(int)
+        penalty = 0
+        resource_usage = defaultdict(int)
+        idle_time_penalty = 0
+        critical_path_penalty = 0
+        if not validate_chromosome(chromosome, self.quantum, self.jobs):
+            return float('inf')
+        for gene in chromosome:
+            _, _, start, end = gene
+            if start < 0 or end <= start:
+                return float('inf')
+        critical_jobs = {str(job.job_id) for job in self.jobs.values() if job.dependencies}
+
+        sorted_genes = sorted(chromosome, key=lambda x: x[2])
+        for gene in sorted_genes:
+            job_id, resource_id, start_time, end_time = gene
+            duration = end_time - start_time
+
+            if duration <= 0:
+                return float('i2nf')
+
+            if '_' in str(job_id):
+                base_id = str(job_id).split('_')[0]
+                chunk_num = int(str(job_id).split('_')[1])
+                job = self.jobs.get(int(base_id))
+
+                if chunk_num == 1:
+                    dependencies = job.dependencies
+                else:
+                    prev_chunk = f"{base_id}_{chunk_num - 1}"
+                    dependencies = [prev_chunk]
+            else:
+                job = self.jobs.get(job_id)
+                dependencies = job.dependencies
+
+            if not job or resource_id not in self.resources:
+                return float('inf')
+
+            dep_finish = max([completion_times.get(dep, 0) for dep in dependencies], default=0)
+            if start_time < dep_finish:
+                penalty += 100 * (dep_finish - start_time)
+                start_time = dep_finish
+
+            overlap_penalty = 0
+            for interval in timelines[resource_id]:
+                if not (end_time <= interval[0] or start_time >= interval[1]):
+                    overlap_duration = min(end_time, interval[1]) - max(start_time, interval[0])
+                    overlap_penalty += 100 * overlap_duration
+            penalty += overlap_penalty
+
+            if timelines[resource_id]:
+                last_end = timelines[resource_id][-1][1]
+                if start_time > last_end:
+                    idle_time = start_time - last_end
+                    idle_time_penalty += idle_time * 0.2  # Penalty weight: 0.5×
+
+            timelines[resource_id].append((start_time, end_time, job_id))
+            completion_times[job_id] = end_time
+            resource_utilization[resource_id] += duration
+            resource_usage[resource_id] += duration
+
+            base_id = str(job_id).split('_')[0]
+            if base_id in critical_jobs:
+                critical_path_penalty += duration * 0.1
+
+            if resource_usage[resource_id] > self.resources[resource_id].capacity:
+                return float('inf')
+
+        makespan = max(completion_times.values(), default=0)
+
+        total_capacity = sum(r.capacity for r in self.resources.values())
+        util_penalty = 0
+        if total_capacity > 0:
+            avg_utilization = sum(resource_utilization.values()) / total_capacity
+            for rid, util in resource_utilization.items():
+                deviation = abs(util - avg_utilization)
+                util_penalty += deviation * 0.1
+
+        total_fitness = (
+                makespan
+                + penalty
+                + idle_time_penalty
+                + util_penalty
+                + critical_path_penalty
+        )
+
+        return total_fitness
+
+    def generate_schedule_table(self, chromosome):
+        schedule_table = []
+        resource_usage = defaultdict(int)
+        sorted_genes = sorted(chromosome, key=lambda x: x[2])
+
+        for job_id, resource_id, start_time, end_time in sorted_genes:
+            if '_' in str(job_id):
+                base_id = int(job_id.split('_')[0])
+                job = self.jobs[base_id]
+                chunk_num = int(job_id.split('_')[1])
+                total_chunks = math.ceil(job.duration / self.quantum)
+
+                if chunk_num == total_chunks:
+                    remaining = job.duration % self.quantum
+                    if remaining > 0:
+                        end_time = start_time + remaining
+            else:
+                job = self.jobs[job_id]
+
+            duration = end_time - start_time
+            resource_usage[resource_id] += duration
+
+            if '_' in str(job_id):
+                base_id = job_id.split('_')[0]
+                total_duration = self.jobs[int(base_id)].duration
+            else:
+                total_duration = duration
+
+            schedule_table.append({
+                'Resource ID': resource_id,
+                'Job ID': job_id,
+                'Start Time': start_time,
+                'End Time': end_time,
+                'Duration': duration,
+                'Total Duration': total_duration
+            })
+
+        print("\nResource Utilization:")
+        print("Resource ID | Used Time/Capacity | Utilization % | Status")
+        for rid, resource in self.resources.items():
+            used_time = resource_usage.get(rid, 0)
+            util = (used_time / resource.capacity) * 100 if resource.capacity > 0 else 0
+            status = "OK" if used_time <= resource.capacity else "OVERLOADED"
+            print(f"{rid:10} | {used_time:5}/{resource.capacity:5} | {util:6.2f}% | {status}")
+
+        return schedule_table
+
+
+def encode_jobs(jobs, resources, divide_jobs=False, time_per_chunk=5, valid_resource_ids=None):
+    chromosome = []
+    resource_map = {r.resource_id: r for r in resources}
+    resource_available = {rid: 0 for rid in valid_resource_ids}
+    resource_remaining_capacity = {rid: r.capacity for rid, r in resource_map.items()}
+    completion_times = {}
+    jobs_to_schedule = jobs.copy()
+    random.shuffle(jobs_to_schedule)
+    scheduled_jobs = set()
+
+    jobs_to_schedule.sort(key=lambda x: -x.duration)
+
+    for job in jobs_to_schedule:
+        if not divide_jobs and not any(r.capacity >= job.duration for r in resources):
+            raise ValueError(
+                f"Job {job.job_id} (duration={job.duration}) is too large for any resource when chunking is disabled")
+
+    while jobs_to_schedule:
+        scheduled_this_round = False
+
+        for job in jobs_to_schedule[:]:
+            if all(dep in scheduled_jobs for dep in job.dependencies):
+                if divide_jobs and job.duration > time_per_chunk:
+                    remaining_duration = job.duration
+                    chunk_num = 1
+                    total_chunks = math.ceil(job.duration / time_per_chunk)
+                    last_chunk_end = None
+
+                    while remaining_duration > 0:
+                        chunk_duration = min(time_per_chunk, remaining_duration)
+                        best_resource = None
+                        best_start = float('inf')
+
+                        dependencies = job.dependencies if chunk_num == 1 else [f"{job.job_id}_{chunk_num - 1}"]
+
+                        for resource_id in valid_resource_ids:
+                            if resource_remaining_capacity[resource_id] < chunk_duration:
+                                continue
+
+                            start_time = max(
+                                max([completion_times.get(dep, 0) for dep in dependencies], default=0),
+                                resource_available[resource_id]
+                            )
+
+                            if start_time < best_start:
+                                best_resource = resource_id
+                                best_start = start_time
+
+                        if best_resource is not None:
+                            end_time = best_start + chunk_duration
+                            chunk_id = f"{job.job_id}_{chunk_num}"
+                            chromosome.append((chunk_id, best_resource, best_start, end_time))
+                            resource_remaining_capacity[best_resource] -= chunk_duration
+                            resource_available[best_resource] = end_time
+                            completion_times[chunk_id] = end_time
+                            remaining_duration -= chunk_duration
+                            last_chunk_end = end_time
+                            chunk_num += 1
+                            scheduled_this_round = True
+                        else:
+                            break
+
+                    if remaining_duration == 0:
+                        scheduled_jobs.add(job.job_id)
+                        completion_times[job.job_id] = last_chunk_end
+                        jobs_to_schedule.remove(job)
+                else:
+                    best_resource = None
+                    best_start = float('inf')
+
+                    for resource_id in valid_resource_ids:
+                        if resource_remaining_capacity[resource_id] < job.duration:
+                            continue
+
+                        start_time = max(
+                            max([completion_times.get(dep, 0) for dep in job.dependencies], default=0),
+                            resource_available[resource_id]
+                        )
+
+                        if start_time < best_start:
+                            best_resource = resource_id
+                            best_start = start_time
+
+                    if best_resource is not None:
+                        end_time = best_start + job.duration
+                        chromosome.append((job.job_id, best_resource, best_start, end_time))
+                        resource_remaining_capacity[best_resource] -= job.duration
+                        resource_available[best_resource] = end_time
+                        scheduled_jobs.add(job.job_id)
+                        completion_times[job.job_id] = end_time
+                        jobs_to_schedule.remove(job)
+                        scheduled_this_round = True
+
+        if not scheduled_this_round and jobs_to_schedule:
+            for job in jobs_to_schedule[:]:
+                if all(dep in scheduled_jobs for dep in job.dependencies):
+                    for resource_id in valid_resource_ids:
+                        if (divide_jobs and job.duration > time_per_chunk) or resource_map[
+                            resource_id].capacity >= job.duration:
+                            break
+            break
+
+    return chromosome
+
+
+def create_population(jobs, resources, population_size, divide_jobs=False, time_per_chunk=5, valid_resource_ids=None):
+    if not valid_resource_ids:
+        valid_resource_ids = [r.resource_id for r in resources]
+
+    population = []
+    while len(population) < population_size:
+        chrom = encode_jobs(jobs, resources, divide_jobs, time_per_chunk, valid_resource_ids)
+
+        if not population or not any(c == chrom for c in population):
+            population.append(chrom)
+        else:
+            chrom = mutate(chrom, valid_resource_ids, mutation_rate=0.5)
+            population.append(chrom)
+
+    return population
+
+
+def select_population(population, fitness_values, selection_ratio=0.8, tournament_size=3):
+    best_idx = fitness_values.index(min(fitness_values))
+    selected = [population[best_idx]]
+    num_to_select = max(1, int(len(population) * selection_ratio)) - 1
+
+    for _ in range(num_to_select):
+        tournament = random.sample(list(zip(population, fitness_values)), tournament_size)
+        winner = min(tournament, key=lambda x: x[1])[0]
+        selected.append(deepcopy(winner))
+
+    return selected
+
+
+def crossover(parent1, parent2, crossover_rate=0.8):
+    if random.random() > crossover_rate:
+        return deepcopy(parent1), deepcopy(parent2)
+
+    size = min(len(parent1), len(parent2))
+    a, b = sorted(random.sample(range(size), 2))
+
+    child1_segment = parent1[a:b]
+    child2_segment = parent2[a:b]
+
+    seg1_jobs = {gene[0] for gene in child1_segment}
+    seg2_jobs = {gene[0] for gene in child2_segment}
+
+    child1 = child1_segment[:]
+    child2 = child2_segment[:]
+
+    for gene in parent2:
+        if gene[0] not in seg1_jobs:
+            child1.append(gene)
+
+    for gene in parent1:
+        if gene[0] not in seg2_jobs:
+            child2.append(gene)
+
+    return child1, child2
+
+
+def mutate(chromosome, valid_resource_ids, mutation_rate=0.1):
+    mutated = []
+    for gene in chromosome:
+        if random.random() < mutation_rate:
+            job_id, resource_id, start_time, end_time = gene
+
+            if '_' not in str(job_id):
+                if random.random() < 0.7:
+                    new_resource = random.choice(valid_resource_ids)
+                    mutated.append((job_id, new_resource, start_time, end_time))
+                else:
+                    shift = random.randint(-2, 2)
+                    new_start = max(0, start_time + shift)
+                    new_end = end_time + shift
+                    if new_end > new_start:
+                        mutated.append((job_id, resource_id, new_start, new_end))
+                    else:
+                        mutated.append(gene)
+            else:
+                new_resource = random.choice(valid_resource_ids)
+                mutated.append((job_id, new_resource, start_time, end_time))
+        else:
+            mutated.append(gene)
+    return mutated
+
+
+def validate_chromosome(chromosome, quantum, jobs_dict):
+    for gene in chromosome:
+        job_id, _, start, end = gene
+        if '_' in str(job_id):
+            base_id = int(job_id.split('_')[0])
+            chunk_num = int(job_id.split('_')[1])
+            job = jobs_dict.get(base_id)
+            if not job:
+                return False
+
+            total_chunks = math.ceil(job.duration / quantum)
+            duration = end - start
+            expected_duration = (quantum if chunk_num < total_chunks
+                                 else (job.duration % quantum or quantum))
+
+            if duration != expected_duration:
+                return False
+    return True
+
+
+def create_offspring(selected_population, jobs, resources, valid_resource_ids, crossover_rate, mutation_rate, quantum):
+    offspring = []
+    jobs_dict = {job.job_id: job for job in jobs}
+
+    for i in range(0, len(selected_population), 2):
+        if i + 1 >= len(selected_population):
+            offspring.append(deepcopy(selected_population[i]))
+            continue
+
+        parent1 = selected_population[i]
+        parent2 = selected_population[i + 1]
+
+        child1, child2 = crossover(parent1, parent2, crossover_rate)
+        child1 = mutate(child1, valid_resource_ids, mutation_rate)
+        child2 = mutate(child2, valid_resource_ids, mutation_rate)
+
+        if validate_chromosome(child1, quantum, jobs_dict):
+            offspring.append(child1)
+        if validate_chromosome(child2, quantum, jobs_dict):
+            offspring.append(child2)
+
+    return offspring
+
+
+def evolve(jobs, resources, population_size=50,
+           mutation_rate=0.2, crossover_rate=0.8, selection_ratio=0.8,
+           quantum=1, allow_chunking=False,
+           patience=20):
+    scheduler = JobScheduler(jobs, resources, quantum, allow_chunking)
+    valid_resource_ids = [r.resource_id for r in resources]
+
+    population = create_population(jobs, resources, population_size,
+                                   allow_chunking, quantum, valid_resource_ids)
+
+    print("\n=== Initial Population ===")
+    initial_fitness = [scheduler.fitness(chrom) for chrom in population]
+    for idx, (chrom, fit) in enumerate(zip(population, initial_fitness)):
+        print(f"\nChromosome {idx + 1}: Fitness = {fit:.2f}")
+        for gene in chrom[:3]:
+            print(f"  Job {gene[0]} on R{gene[1]}: {gene[2]}-{gene[3]}")
+
+    best_fitness = float('inf')
+    best_chromosome = None
+    no_improvement = 0
+    generation = 0
+
+    while no_improvement < patience:
+        fitness_values = [scheduler.fitness(chrom) for chrom in population]
+
+        current_best = min(fitness_values)
+        current_worst = max(fitness_values)
+        current_avg = sum(fitness_values) / len(fitness_values)
+        best_idx = fitness_values.index(current_best)
+
+        print(f"\n=== Generation {generation} ===")
+        print(f"Best: {current_best:.2f} | Worst: {current_worst:.2f} | Avg: {current_avg:.2f}")
+        print(f"No improvement: {no_improvement}/{patience}")
+
+        if current_best < best_fitness:
+            best_fitness = current_best
+            best_chromosome = deepcopy(population[best_idx])
+            no_improvement = 0
+            print(f"\n NEW BEST FOUND! Fitness: {best_fitness:.2f}")
+        else:
+            no_improvement += 1
+
+        selected = select_population(population, fitness_values, selection_ratio)
+        offspring = create_offspring(selected, jobs, resources, valid_resource_ids,
+                                     crossover_rate, mutation_rate, quantum)
+
+        population = offspring[:population_size]
+        if best_chromosome and (best_chromosome not in population):
+            population[-1] = best_chromosome
+
+        generation += 1
+
+    print(f"\n=== Evolution Completed ===")
+    print(f"Total Generations: {generation}")
+    print(f"Best Fitness: {best_fitness:.2f}")
+    print("\nBest Schedule:")
+    for gene in best_chromosome:
+        print(f"Job {gene[0]} on R{gene[1]}: {gene[2]}-{gene[3]} (Duration: {gene[3] - gene[2]})")
+
+    return best_chromosome, best_fitness
+
+
+def detect_circular_dependencies(jobs):
+    job_map = {job.job_id: job for job in jobs}
+    visited = set()
+    recursion_stack = set()
+
+    def has_cycle(job_id):
+        if job_id in recursion_stack:
+            return True
+        if job_id in visited:
+            return False
+
+        visited.add(job_id)
+        recursion_stack.add(job_id)
+
+        for dep in job_map[job_id].dependencies:
+            if has_cycle(dep):
+                return True
+
+        recursion_stack.remove(job_id)
+        return False
+
+    for job in jobs:
+        if has_cycle(job.job_id):
+            return True
+    return False
+
+
+class SchedulerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Advanced Genetic Job Scheduler")
+        self.root.geometry("900x600")
+        self.jobs = []
+        self.resources = []
+        self.last_schedule = None
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background='#f0f0f0')
+        style.configure('TButton', font=('Helvetica', 10, 'bold'))
+        style.configure('TLabel', background='#f0f0f0', font=('Helvetica', 10))
+
+        self.setup_widgets()
+
+    def setup_widgets(self):
+        frame = ttk.Frame(self.root, padding=20)
+        frame.pack(fill='both', expand=True)
+
+        top_frame = ttk.Frame(frame)
+        top_frame.pack(pady=10)
+
+        ttk.Label(top_frame, text="Number of Jobs:").grid(row=0, column=0, padx=5, pady=5, sticky='e')
+        self.job_count_entry = ttk.Entry(top_frame, width=10)
+        self.job_count_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(top_frame, text="Number of Resources:").grid(row=0, column=2, padx=5, pady=5, sticky='e')
+        self.resource_count_entry = ttk.Entry(top_frame, width=10)
+        self.resource_count_entry.grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Label(top_frame, text="Chunk Size:").grid(row=0, column=5, padx=5, sticky='e')
+        self.chunk_size_entry = ttk.Entry(top_frame, width=5)
+        self.chunk_size_entry.insert(0, "5")
+        self.chunk_size_entry.grid(row=0, column=6, padx=5)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="Set Jobs", command=self.open_job_input).grid(row=0, column=0, padx=10)
+        ttk.Button(btn_frame, text="Set Resources", command=self.open_resource_input).grid(row=0, column=1, padx=10)
+        ttk.Button(btn_frame, text="Run Scheduler", command=self.run_scheduler).grid(row=0, column=2, padx=10)
+        ttk.Button(btn_frame, text="Show Gantt Chart", command=self.show_last_gantt_chart).grid(row=0, column=3,
+                                                                                                padx=10)
+
+        output_frame = ttk.LabelFrame(frame, text="Schedule Output")
+        output_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        self.output_text = tk.Text(output_frame, wrap='none', font=('Courier', 10), bg='#ffffff')
+        self.output_text.pack(fill='both', expand=True)
+
+        input_frame = ttk.LabelFrame(frame, text="Current Input Data")
+        input_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+        self.input_display = None
+
+        self.input_display = tk.Text(input_frame, wrap='none', font=('Courier', 10), height=10, bg='#f5f5f5')
+        self.input_display.pack(fill='both', expand=True)
+
+    def log(self, message):
+        self.output_text.insert(tk.END, message + '\n')
+        self.output_text.see(tk.END)
+
+    def open_job_input(self):
+        try:
+            count = int(self.job_count_entry.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid number of jobs")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Enter Job Details")
+
+        labels = ["Job ID", "Duration", "Dependencies (comma-separated)"]
+        for i, label in enumerate(labels):
+            ttk.Label(window, text=label).grid(row=0, column=i)
+
+        self.job_entries = []
+        for i in range(count):
+            row_entries = []
+            for j in range(3):
+                e = ttk.Entry(window, width=15)
+                e.grid(row=i + 1, column=j)
+                row_entries.append(e)
+            self.job_entries.append(row_entries)
+
+        def save_jobs():
+            jobs = []
+            job_ids = set()
+            try:
+                for entries in self.job_entries:
+                    jid = entries[0].get().strip()
+                    dur = int(entries[1].get().strip())
+                    deps_raw = entries[2].get().strip()
+                    deps = []
+                    if deps_raw:
+                        deps = [int(d.strip()) for d in deps_raw.split(',') if d.strip()]
+                    if not jid:
+                        messagebox.showerror("Error", "Job ID cannot be empty")
+                        return
+                    if jid in job_ids:
+                        messagebox.showerror("Error", f"Duplicate Job ID: {jid}")
+                        return
+                    job_ids.add(jid)
+                    jobs.append(Job(int(jid), dur, deps))
+            except Exception as e:
+                messagebox.showerror("Error", f"Invalid job data: {e}")
+                return
+
+            self.jobs = jobs
+            window.destroy()
+            messagebox.showinfo("Success", "Jobs saved successfully.")
+            self.display_input_data()
+
+        ttk.Button(window, text="Save Jobs", command=save_jobs).grid(row=count + 1, column=1, pady=5)
+
+    def open_resource_input(self):
+        try:
+            count = int(self.resource_count_entry.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid number of resources")
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Enter Resource Details")
+
+        labels = ["Resource ID", "Capacity"]
+        for i, label in enumerate(labels):
+            ttk.Label(window, text=label).grid(row=0, column=i)
+
+        self.resource_entries = []
+        for i in range(count):
+            row_entries = []
+            for j in range(2):
+                e = ttk.Entry(window, width=15)
+                e.grid(row=i + 1, column=j)
+                row_entries.append(e)
+            self.resource_entries.append(row_entries)
+
+        def save_resources():
+            resources = []
+            resource_ids = set()
+            try:
+                for entries in self.resource_entries:
+                    rid = entries[0].get().strip()
+                    cap = int(entries[1].get().strip())
+                    if not rid:
+                        messagebox.showerror("Error", "Resource ID cannot be empty")
+                        return
+                    if rid in resource_ids:
+                        messagebox.showerror("Error", f"Duplicate Resource ID: {rid}")
+                        return
+                    resource_ids.add(rid)
+                    resources.append(Resource(int(rid), cap))
+            except Exception as e:
+                messagebox.showerror("Error", f"Invalid resource data: {e}")
+                return
+
+            self.resources = resources
+            window.destroy()
+            messagebox.showinfo("Success", "Resources saved successfully.")
+            self.display_input_data()
+
+        ttk.Button(window, text="Save Resources", command=save_resources).grid(row=count + 1, column=1, pady=5)
+
+    def run_scheduler(self):
+        if not self.jobs or not self.resources:
+            messagebox.showwarning("Missing Data", "Please set jobs and resources first.")
+            return
+
+        if detect_circular_dependencies(self.jobs):
+            messagebox.showerror("Error", "Circular dependencies detected among jobs.")
+            return
+
+        total_capacity = sum(r.capacity for r in self.resources)
+        total_duration = sum(j.duration for j in self.jobs)
+        if total_duration > total_capacity:
+            messagebox.showerror("Error", "Total job durations exceed total resource capacities.")
+            return
+
+        divide_jobs = True
+        if divide_jobs:
+            try:
+                quantum = int(self.chunk_size_entry.get())
+                if quantum <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Error", "Invalid chunk size. Please enter a positive integer.")
+                return
+        else:
+            quantum = 1
+
+        try:
+            best_chromosome, best_fitness = evolve(self.jobs, self.resources, population_size=20, mutation_rate=0.3,
+                                                   crossover_rate=0.8, selection_ratio=0.8, quantum=quantum,
+                                       allow_chunking=True, patience=15)
+            self.output_text.delete(1.0, tk.END)
+            self.log("Best Schedule Found:\n")
+
+            scheduler = JobScheduler(self.jobs, self.resources, quantum, divide_jobs)
+            schedule_table = scheduler.generate_schedule_table(best_chromosome)
+
+            self.log("Resource Schedule:")
+            self.log("-" * 85)
+            self.log(
+                f"{'Resource ID':<12} | {'Job ID':<12} | {'Start':<8} | {'End':<8} | {'Duration':<10} | {'Total Duration':<14}")
+            self.log("-" * 85)
+            for entry in schedule_table:
+                self.log(
+                    f"{entry['Resource ID']:<12} | {entry['Job ID']:<12} | {entry['Start Time']:<8} | {entry['End Time']:<8} | {entry['Duration']:<10} | {entry.get('Total Duration', entry['Duration']):<14}")
+            self.log("-" * 85)
+            self.log(f"\nTotal Makespan: {best_fitness:.2f}")
+            self.show_gantt_chart(schedule_table)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Scheduling failed: {e}")
+            return
+
+        self.last_schedule = (best_chromosome, best_fitness)
+
+        self.output_text.delete(1.0, tk.END)
+        self.output_text.insert(tk.END, f"Best Fitness (Makespan): {best_fitness:.2f}\n\nSchedule:\n")
+
+        scheduler = JobScheduler(self.jobs, self.resources, quantum, divide_jobs)
+        schedule_table = scheduler.generate_schedule_table(best_chromosome)
+
+        for entry in schedule_table:
+            self.output_text.insert(tk.END,
+                                    f"Resource {entry['Resource ID']} | Job {entry['Job ID']} | Start {entry['Start Time']} | "
+                                    f"End {entry['End Time']} | Duration {entry['Duration']}\n")
+
+    def display_input_data(self):
+        self.input_display.delete(1.0, tk.END)
+        self.input_display.insert(tk.END, "Jobs:\n")
+        for job in self.jobs:
+            deps = ', '.join(map(str, job.dependencies)) if job.dependencies else "None"
+            self.input_display.insert(tk.END, f"  Job {job.job_id}: Duration={job.duration}, Dependencies={deps}\n")
+
+        self.input_display.insert(tk.END, "\nResources:\n")
+        for res in self.resources:
+            self.input_display.insert(tk.END, f"  Resource {res.resource_id}: Capacity={res.capacity}\n")
+
+    def show_last_gantt_chart(self):
+        if not self.last_schedule:
+            messagebox.showwarning("No Schedule", "Please run the scheduler first to generate a schedule.")
+            return
+
+        best_chromosome, _ = self.last_schedule
+        quantum = int(self.chunk_size_entry.get())
+        scheduler = JobScheduler(self.jobs, self.resources,
+                                 quantum=quantum,
+                                 allow_chunking=True)
+        schedule_table = scheduler.generate_schedule_table(best_chromosome)
+
+        self.show_gantt_chart(schedule_table)
+
+    def show_gantt_chart(self, schedule):
+        fig, ax = plt.subplots(figsize=(10, 4))
+        colors = plt.colormaps['tab20'].colors
+        resource_y = {}
+        y = 0
+
+        for entry in schedule:
+            rid = entry['Resource ID']
+            if rid not in resource_y:
+                resource_y[rid] = y
+                y += 1
+
+        for entry in schedule:
+            rid = entry['Resource ID']
+            y_pos = resource_y[rid]
+            start = entry['Start Time']
+            duration = entry['Duration']
+            job_label = f"Job {entry['Job ID']}"
+            color_index = (int(str(entry['Job ID']).split('_')[0]) if '_' in str(entry['Job ID']) else entry[
+                'Job ID']) % 20
+            color = colors[color_index]
+
+            ax.barh(y_pos, duration, left=start, color=color, edgecolor='black')
+            ax.text(start + duration / 2, y_pos, job_label, ha='center', va='center', color='white', fontsize=8)
+
+        ax.set_yticks(list(resource_y.values()))
+        ax.set_yticklabels([f"Resource {rid}" for rid in resource_y.keys()])
+        ax.set_xlabel("Time")
+        ax.set_title("Gantt Chart")
+        ax.grid(True)
+
+        chart_win = tk.Toplevel(self.root)
+        chart_win.title("Gantt Chart")
+        canvas = FigureCanvasTkAgg(fig, master=chart_win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SchedulerGUI(root)
+    root.mainloop()
